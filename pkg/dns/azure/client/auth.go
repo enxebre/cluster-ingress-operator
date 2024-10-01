@@ -3,6 +3,7 @@ package client
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -71,17 +72,16 @@ func getAuthorizerForResource(config Config) (autorest.Authorizer, error) {
 
 	var cred azcore.TokenCredential
 	// Managed Identity Override for ARO HCP
-	managedIdentityClientID := os.Getenv("ARO_HCP_MI_CLIENT_ID")
-	if managedIdentityClientID != "" {
-		options := azidentity.ManagedIdentityCredentialOptions{
+	useCert := os.Getenv("AZURE_CLIENT_CERTIFICATE_PATH")
+	if useCert != "" {
+		options := azidentity.DefaultAzureCredentialOptions{
 			ClientOptions: azcore.ClientOptions{
 				Cloud: cloudConfig,
 			},
-			ID: azidentity.ClientID(managedIdentityClientID),
 		}
 
 		var err error
-		cred, err = azidentity.NewManagedIdentityCredential(&options)
+		cred, err = azureCreds(&options)
 		if err != nil {
 			return nil, err
 		}
@@ -131,4 +131,75 @@ func endpointToScope(endpoint string) string {
 		scope += "/.default"
 	}
 	return scope
+}
+
+func azureCreds(options *azidentity.DefaultAzureCredentialOptions) (*azidentity.DefaultAzureCredential, error) {
+	if certPath := os.Getenv("AZURE_CLIENT_CERTIFICATE_PATH"); certPath != "" {
+		// Set up a watch on our config file; if it changes, we should exit -
+		// (we don't have the ability to dynamically reload config changes).
+		if err := watchForChanges(certPath, stopCh); err != nil {
+			return nil, err
+		}
+	}
+
+	return azidentity.NewDefaultAzureCredential(options)
+}
+
+// watchForChanges closes stopCh if the configuration file changed.
+func watchForChanges(configPath string, stopCh chan struct{}) error {
+	configPath, err := filepath.Abs(configPath)
+	if err != nil {
+		return err
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+
+	// Watch all symlinks for changes
+	p := configPath
+	maxdepth := 100
+	for depth := 0; depth < maxdepth; depth++ {
+		if err := watcher.Add(p); err != nil {
+			return err
+		}
+		klog.V(2).Infof("Watching config file %s for changes", p)
+
+		stat, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+
+		// configmaps are usually symlinks
+		if stat.Mode()&os.ModeSymlink > 0 {
+			p, err = filepath.EvalSymlinks(p)
+			if err != nil {
+				return err
+			}
+		} else {
+			break
+		}
+	}
+
+	go func() {
+		for {
+			select {
+			case <-stopCh:
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				klog.V(2).Infof("Configuration file %s changed, exiting...", event.Name)
+				close(stopCh)
+				return
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				klog.V(4).Infof("fsnotify error %v", err)
+			}
+		}
+	}()
+	return nil
 }
